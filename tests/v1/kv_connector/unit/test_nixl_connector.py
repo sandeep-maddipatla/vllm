@@ -38,7 +38,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     NixlConnectorWorker,
     NixlHandshakePayload,
     NixlKVConnectorStats,
+    collect_nixl_handshake_props,
     compute_nixl_compatibility_hash,
+    validate_nixl_handshake_props,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
@@ -2240,6 +2242,41 @@ def test_compatibility_hash_validation(
             # Verify handshake returned agent mapping
             assert isinstance(result, dict)
             assert len(result) == 1
+
+
+def test_validate_handshake_props_detects_revision_mismatch(default_vllm_config):
+    local_props = collect_nixl_handshake_props(
+        default_vllm_config,
+        attn_backend_name="FLASH_ATTN",
+        kv_cache_layout="HND",
+        use_mla=False,
+        cross_layers_blocks=False,
+    )
+    remote_props = dict(local_props)
+    remote_props["revision"] = '"different-revision"'
+
+    with pytest.raises(RuntimeError, match="revision"):
+        validate_nixl_handshake_props(local_props, remote_props)
+
+
+def test_validate_handshake_props_allows_expected_layout_mismatch(
+    default_vllm_config,
+):
+    local_props = collect_nixl_handshake_props(
+        default_vllm_config,
+        attn_backend_name="FLASH_ATTN",
+        kv_cache_layout="NHD",
+        use_mla=False,
+        cross_layers_blocks=False,
+    )
+    remote_props = dict(local_props)
+    remote_props["kv_cache_layout"] = '"HND"'
+
+    validate_nixl_handshake_props(
+        local_props,
+        remote_props,
+        allow_layout_mismatch=True,
+    )
 
 
 @pytest.mark.parametrize(

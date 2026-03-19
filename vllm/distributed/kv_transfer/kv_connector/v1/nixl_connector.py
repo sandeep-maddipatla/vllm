@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import json
 import logging
 import math
 import os
@@ -13,7 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -80,8 +81,9 @@ ReqId = str
 # Version History:
 #   1: Initial version with compatibility checking
 #   2: Add remote_request_id to kv_transfer_params
+#   3: Add explicit handshake compatibility properties to NixlAgentMetadata
 #
-NIXL_CONNECTOR_VERSION: int = 2
+NIXL_CONNECTOR_VERSION: int = 3
 
 GET_META_MSG = b"get_meta_msg"
 
@@ -152,6 +154,7 @@ class NixlAgentMetadata:
     block_lens: list[int]
     kv_cache_layout: str
     block_size: int
+    handshake_props: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -231,6 +234,124 @@ def compute_nixl_compatibility_hash(
         attn_backend_name,
     )
     return compat_hash
+
+
+def collect_nixl_handshake_props(
+    vllm_config: VllmConfig,
+    *,
+    attn_backend_name: str,
+    kv_cache_layout: str,
+    use_mla: bool,
+    cross_layers_blocks: bool,
+    block_window_per_layer: list[int | None] | None = None,
+) -> dict[str, str]:
+    """Collect explicit compatibility properties for handshake validation."""
+
+    def _encode(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+
+    props = {
+        "model": model_config.model,
+        "revision": model_config.revision,
+        "code_revision": model_config.code_revision,
+        "dtype": str(model_config.dtype),
+        "cache_dtype": str(cache_config.cache_dtype),
+        "num_kv_heads": model_config.get_total_num_kv_heads(),
+        "head_size": model_config.get_head_size(),
+        "num_hidden_layers": model_config.get_total_num_hidden_layers(),
+        "attn_backend_name": attn_backend_name,
+        "kv_cache_layout": kv_cache_layout,
+        "use_mla": use_mla,
+        "cross_layers_blocks": cross_layers_blocks,
+        "sliding_window": model_config.get_sliding_window(),
+        "disable_sliding_window": model_config.disable_sliding_window,
+        "attention_chunk_size": model_config.attention_chunk_size,
+        "no_rope_layers": getattr(hf_text_config, "no_rope_layers", None),
+        "rope_theta": getattr(hf_text_config, "rope_theta", None),
+        "rope_scaling": getattr(hf_text_config, "rope_scaling", None),
+        "block_window_per_layer": block_window_per_layer,
+    }
+    return {key: _encode(value) for key, value in props.items()}
+
+
+def validate_nixl_handshake_props(
+    local_props: dict[str, str],
+    remote_props: dict[str, str],
+    *,
+    allow_layout_mismatch: bool = False,
+) -> None:
+    """Validate explicit P/D compatibility properties exchanged at handshake."""
+
+    if not remote_props:
+        logger.debug(
+            "NIXL handshake property validation skipped: remote_props missing "
+            "(peer likely on older connector schema)."
+        )
+        return
+
+    keys_to_check = (
+        "model",
+        "revision",
+        "code_revision",
+        "dtype",
+        "cache_dtype",
+        "num_kv_heads",
+        "head_size",
+        "num_hidden_layers",
+        "attn_backend_name",
+        "use_mla",
+        "cross_layers_blocks",
+        "sliding_window",
+        "disable_sliding_window",
+        "attention_chunk_size",
+        "no_rope_layers",
+        "rope_theta",
+        "rope_scaling",
+        "block_window_per_layer",
+    )
+
+    mismatches = []
+    matches = []
+    for key in keys_to_check:
+        local_value = local_props.get(key)
+        remote_value = remote_props.get(key)
+        if local_value != remote_value:
+            mismatches.append(
+                f"{key}: local={local_value}, remote={remote_value}"
+            )
+        else:
+            matches.append(f"{key}: value={local_value}")
+
+    if not allow_layout_mismatch:
+        local_layout = local_props.get("kv_cache_layout")
+        remote_layout = remote_props.get("kv_cache_layout")
+        if local_layout != remote_layout:
+            mismatches.append(
+                "kv_cache_layout: "
+                f"local={local_layout}, remote={remote_layout}"
+            )
+        else:
+            matches.append(f"kv_cache_layout: value={local_layout}")
+
+    for line in matches:
+        logger.debug("NIXL handshake prop match: %s", line)
+
+    if mismatches:
+        for line in mismatches:
+            logger.warning("NIXL handshake prop mismatch: %s", line)
+        logger.warning(
+            "NIXL handshake compatibility property mismatches detected: %d field(s).",
+            len(mismatches),
+        )
+    else:
+        logger.debug(
+            "NIXL handshake compatibility property validation passed with %d fields.",
+            len(matches),
+        )
 
 
 @dataclass
@@ -1018,6 +1139,7 @@ class NixlConnectorWorker:
         # lazy initialized in register_kv_caches
         self.compat_hash: str | None = None
         self.kv_topo: TpKVTopology | None = None
+        self._local_handshake_props: dict[str, str] | None = None
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.world_size}
         self._block_size: dict[EngineId, int] = {self.engine_id: self.block_size}
@@ -1305,6 +1427,19 @@ class NixlConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name, self.kv_topo.cross_layers_blocks
         )
+        effective_kv_cache_layout = (
+            self.kv_cache_layout
+            if not self.use_host_buffer
+            else self.host_buffer_kv_cache_layout
+        )
+        self._local_handshake_props = collect_nixl_handshake_props(
+            self.vllm_config,
+            attn_backend_name=self.backend_name,
+            kv_cache_layout=effective_kv_cache_layout,
+            use_mla=self.use_mla,
+            cross_layers_blocks=self.kv_topo.cross_layers_blocks,
+            block_window_per_layer=self.block_window_per_layer,
+        )
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -1473,6 +1608,7 @@ class NixlConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
+            handshake_props=self._local_handshake_props or {},
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1754,6 +1890,28 @@ class NixlConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout
         )
+        local_handshake_props = self._local_handshake_props
+        if local_handshake_props is None:
+            local_handshake_props = collect_nixl_handshake_props(
+                self.vllm_config,
+                attn_backend_name=self.backend_name,
+                kv_cache_layout=kv_cache_layout,
+                use_mla=self.use_mla,
+                cross_layers_blocks=self.kv_topo.cross_layers_blocks,
+                block_window_per_layer=self.block_window_per_layer,
+            )
+
+        allow_layout_mismatch = (
+            not self.use_mla
+            and self.kv_transfer_config.enable_permute_local_kv
+            and nixl_agent_meta.kv_cache_layout == "HND"
+        )
+        validate_nixl_handshake_props(
+            local_handshake_props,
+            nixl_agent_meta.handshake_props,
+            allow_layout_mismatch=allow_layout_mismatch,
+        )
+
         if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
             if (
                 self.kv_transfer_config.enable_permute_local_kv
