@@ -1147,6 +1147,11 @@ class NixlConnectorWorker:
         logger.debug("Detected attention backend %s", self.backend_name)
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
+        # Heterogeneous P/D support: Enable K-cache transpose for CPU→CUDA/XPU transfers
+        self.is_hetero_pd_cpuattn = os.environ.get(
+            "VLLM_HETERO_PD_CPU_ATTN", "0"
+        ).lower() in ("1", "true")
+
         # lazy initialized in register_kv_caches
         self.compat_hash: str | None = None
         self.kv_topo: TpKVTopology | None = None
@@ -2025,6 +2030,137 @@ class NixlConnectorWorker:
                 ",".join(map(str, local_block_ids)),
             )
 
+    def align_hetero_pd_cpuattn_kvcache_format(
+        self,
+        caller: str,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+    ) -> None:
+        """
+        Transpose K cache from CPU column-major to row-major format for heterogeneous P/D.
+
+        CPU attention implementations (vec, neon) use column-major K cache layout.
+        CUDA/XPU flash attention expects row-major layout.
+
+        When doing P/D split with CPU prefill and CUDA/XPU decode, we need to
+        transpose K cache blocks before transfer to ensure decode can correctly
+        interpret the cached data.
+
+        Args:
+            caller: 'sender' or 'receiver' - which side is calling this
+            kv_caches: Dictionary of KV cache tensors (layer_name -> tensor)
+            block_ids: List of block IDs to process
+        """
+        # Bundle all early exit conditions
+        should_skip = (
+            not self.is_hetero_pd_cpuattn
+            or caller != "sender"
+            or self.device_type != "cpu"
+            or not block_ids
+            or self.use_mla  # MLA has different cache structure, skip transpose
+            or not self.use_host_buffer  # Only applies to host buffer transfers
+            or self.backend_name != "CPU_ATTN"  # Only CPU_ATTN uses column-major K
+        )
+
+        if should_skip:
+            logger.debug(
+                "align_hetero_pd_cpuattn_kvcache_format: Skipping K-cache transpose "
+                "(is_hetero_pd_cpuattn=%s, caller=%s, device_type=%s, num_blocks=%d, "
+                "use_mla=%s, use_host_buffer=%s, backend=%s)",
+                self.is_hetero_pd_cpuattn,
+                caller,
+                self.device_type,
+                len(block_ids) if block_ids else 0,
+                self.use_mla,
+                self.use_host_buffer,
+                self.backend_name,
+            )
+            return
+
+        logger.info(
+            "align_hetero_pd_cpuattn_kvcache_format: Transposing K cache for hetero P/D, "
+            "device_type=%s, num_blocks=%d, num_layers=%d",
+            self.device_type,
+            len(block_ids),
+            len(kv_caches),
+        )
+
+        # Process each layer's KV cache
+        # KV cache shape: [2, num_blocks, num_kv_heads, block_size, head_size]
+        # Index 0 is K cache, Index 1 is V cache
+        # Only K cache needs transpose (V is already row-major)
+        for layer_name, kv_cache in kv_caches.items():
+            if kv_cache.shape[0] != 2:
+                logger.warning(
+                    "align_hetero_pd_cpuattn_kvcache_format: Unexpected kv_cache shape %s "
+                    "for layer %s, expected first dim to be 2 [K, V]",
+                    kv_cache.shape,
+                    layer_name,
+                )
+                continue
+
+            # Extract K cache (first element of dim 0)
+            k_cache = kv_cache[0]  # [num_blocks, num_kv_heads, block_size, head_size]
+
+            # Transpose the (block_size, head_size) dimensions for specified blocks
+            # Column-major: [block_size, head_size] with head_size stride faster
+            # Row-major: [block_size, head_size] with block_size stride faster
+            # This transpose converts from column-major to row-major layout
+            for block_id in block_ids:
+                if block_id < k_cache.shape[0]:
+                    num_kv_heads = k_cache[block_id].shape[0]
+                    logger.debug(
+                        "align_hetero_pd_cpuattn_kvcache_format: Processing block_id=%d "
+                        "in layer=%s (shape=%s, num_kv_heads=%d)",
+                        block_id,
+                        layer_name,
+                        k_cache[block_id].shape,
+                        num_kv_heads,
+                    )
+
+                    # Process each KV head separately
+                    for head_idx in range(num_kv_heads):
+                        # Get K cache for this head: [block_size, head_size]
+                        k_head = k_cache[block_id, head_idx]
+                        orig_stride = k_head.stride()
+
+                        # Transpose [block_size, head_size] → [head_size, block_size]
+                        # .contiguous() forces memory reordering to (row-major in transposed space)
+                        # Transpose back [head_size, block_size] → [block_size, head_size]
+                        # Result: [block_size, head_size] but with row-major memory layout
+                        k_head_transposed = k_head.t().contiguous().t()
+                        new_stride = k_head_transposed.stride()
+
+                        # Verify the stride changed from column-major to row-major
+                        if logger.isEnabledFor(logging.DEBUG) and head_idx == 0:
+                            logger.debug(
+                                "align_hetero_pd_cpuattn_kvcache_format: block %d head %d "
+                                "stride changed from %s to %s",
+                                block_id,
+                                head_idx,
+                                orig_stride,
+                                new_stride,
+                            )
+
+                        # Important: Copy back in-place to maintain tensor registration
+                        # Using copy_() to preserve the memory region that NIXL registered
+                        k_cache[block_id, head_idx].copy_(k_head_transposed)
+                else:
+                    logger.warning(
+                        "align_hetero_pd_cpuattn_kvcache_format: block_id=%d out of range "
+                        "for layer=%s (num_blocks=%d)",
+                        block_id,
+                        layer_name,
+                        k_cache.shape[0],
+                    )
+
+        logger.debug(
+            "align_hetero_pd_cpuattn_kvcache_format: Completed K cache alignment for "
+            "%d blocks across %d layers",
+            len(block_ids),
+            len(kv_caches),
+        )
+
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
         """copy kv from device to host buffer."""
         assert self.use_host_buffer
@@ -2048,6 +2184,15 @@ class NixlConnectorWorker:
                 meta.local_physical_block_ids,
                 meta.local_physical_block_ids,
                 "d2h",
+            )
+
+            # Apply K-cache format alignment for heterogeneous P/D if needed
+            # This must happen after d2h copy when using host transfer buffers
+            # so we're operating on the data that will be read by the remote peer
+            self.align_hetero_pd_cpuattn_kvcache_format(
+                caller="sender",
+                kv_caches=self.host_xfer_buffers,
+                block_ids=meta.local_physical_block_ids,
             )
 
     def post_process_device_kv_on_receive(

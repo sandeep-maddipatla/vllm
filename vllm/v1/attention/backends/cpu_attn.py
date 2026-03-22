@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+import os
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
@@ -488,7 +489,17 @@ def _get_attn_isa(
         return "vec16"
     supports_amx = torch._C._cpu._is_amx_tile_supported()
     supports_arm = current_platform.get_cpu_architecture() == CpuArchEnum.ARM
-    if supports_amx and dtype in (torch.bfloat16,) and block_size % 32 == 0:
+    is_hetero_pd_attn = os.environ.get("VLLM_HETERO_PD_CPU_ATTN", "0").lower() in (
+        "1",
+        "true",
+    )
+    # Force non-packed KV layout for heterogeneous P/D transfer compatibility.
+    if is_hetero_pd_attn:
+        logger.debug(
+            "VLLM_HETERO_PD_CPU_ATTN is enabled; disabling AMX CPU_ATTN KV cache compatibility."
+        )
+
+    if supports_amx and dtype in (torch.bfloat16,) and block_size % 32 == 0 and not is_hetero_pd_attn:
         return "amx"
     elif block_size % 32 == 0:
         if supports_arm:
