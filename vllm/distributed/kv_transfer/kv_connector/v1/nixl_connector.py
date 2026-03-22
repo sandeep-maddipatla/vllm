@@ -354,6 +354,17 @@ def validate_nixl_handshake_props(
         )
 
 
+def _decode_handshake_prop(props: dict[str, str], key: str) -> Any:
+    """Decode a JSON-encoded handshake prop for human-readable logging."""
+    value = props.get(key)
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
 @dataclass
 class RemoteMeta:
     block_ids: list[int]
@@ -1901,6 +1912,29 @@ class NixlConnectorWorker:
                 block_window_per_layer=self.block_window_per_layer,
             )
 
+        remote_handshake_props = nixl_agent_meta.handshake_props
+        logger.info(
+            "NIXL handshake KV format summary | "
+            "local(attn_backend=%s, kv_cache_layout=%s, dtype=%s, cache_dtype=%s, "
+            "block_size=%s, num_blocks=%s, block_lens=%s) | "
+            "remote(attn_backend=%s, kv_cache_layout=%s, dtype=%s, cache_dtype=%s, "
+            "block_size=%s, num_blocks=%s, block_lens=%s)",
+            _decode_handshake_prop(local_handshake_props, "attn_backend_name"),
+            _decode_handshake_prop(local_handshake_props, "kv_cache_layout"),
+            _decode_handshake_prop(local_handshake_props, "dtype"),
+            _decode_handshake_prop(local_handshake_props, "cache_dtype"),
+            self.block_size,
+            self.num_blocks,
+            sorted(set(self.block_len_per_layer)),
+            _decode_handshake_prop(remote_handshake_props, "attn_backend_name"),
+            _decode_handshake_prop(remote_handshake_props, "kv_cache_layout"),
+            _decode_handshake_prop(remote_handshake_props, "dtype"),
+            _decode_handshake_prop(remote_handshake_props, "cache_dtype"),
+            nixl_agent_meta.block_size,
+            nixl_agent_meta.num_blocks,
+            sorted(set(nixl_agent_meta.block_lens)),
+        )
+
         allow_layout_mismatch = (
             not self.use_mla
             and self.kv_transfer_config.enable_permute_local_kv
@@ -1908,7 +1942,7 @@ class NixlConnectorWorker:
         )
         validate_nixl_handshake_props(
             local_handshake_props,
-            nixl_agent_meta.handshake_props,
+            remote_handshake_props,
             allow_layout_mismatch=allow_layout_mismatch,
         )
 
