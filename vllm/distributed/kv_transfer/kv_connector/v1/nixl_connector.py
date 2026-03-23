@@ -623,6 +623,18 @@ class NixlConnector(KVConnectorBase_V1):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
+        elif (
+            self.connector_worker.device_type == "cpu"
+            and self.connector_worker.is_hetero_pd_cpuattn
+        ):
+            # For cases involving heterogeneous P/D with CPU attention: transpose K cache in device_kv_caches directly
+            # CPU uses device_kv_caches as the NIXL transfer buffer. Pass that to the translator function
+            for req_id, meta in self._connector_metadata.reqs_to_save.items():
+                self.connector_worker.align_hetero_pd_cpuattn_kvcache_format(
+                    caller="sender",
+                    kv_caches=self.connector_worker.device_kv_caches,
+                    block_ids=meta.local_block_ids,
+                )
 
     def shutdown(self):
         if self.connector_worker is not None:
@@ -2058,7 +2070,6 @@ class NixlConnectorWorker:
             or self.device_type != "cpu"
             or not block_ids
             or self.use_mla  # MLA has different cache structure, skip transpose
-            or not self.use_host_buffer  # Only applies to host buffer transfers
             or self.backend_name != "CPU_ATTN"  # Only CPU_ATTN uses column-major K
         )
 
@@ -2066,31 +2077,38 @@ class NixlConnectorWorker:
             logger.debug(
                 "align_hetero_pd_cpuattn_kvcache_format: Skipping K-cache transpose "
                 "(is_hetero_pd_cpuattn=%s, caller=%s, device_type=%s, num_blocks=%d, "
-                "use_mla=%s, use_host_buffer=%s, backend=%s)",
+                "use_mla=%s, backend=%s)",
                 self.is_hetero_pd_cpuattn,
                 caller,
                 self.device_type,
                 len(block_ids) if block_ids else 0,
                 self.use_mla,
-                self.use_host_buffer,
                 self.backend_name,
             )
             return
 
+        # Determine which cache layout to use
+        cache_layout = (
+            self.host_buffer_kv_cache_layout
+            if self.use_host_buffer
+            else self.kv_cache_layout
+        )
+
         logger.info(
             "align_hetero_pd_cpuattn_kvcache_format: Transposing K cache for hetero P/D, "
-            "device_type=%s, num_blocks=%d, num_layers=%d, layout=%s",
+            "device_type=%s, num_blocks=%d, num_layers=%d, layout=%s, use_host_buffer=%s",
             self.device_type,
             len(block_ids),
             len(kv_caches),
-            self.host_buffer_kv_cache_layout,
+            cache_layout,
+            self.use_host_buffer,
         )
 
         # Start timing the transpose operation
         start_time = time.perf_counter()
 
         # Determine layout for correct indexing
-        is_nhd_layout = self.host_buffer_kv_cache_layout == "NHD"
+        is_nhd_layout = cache_layout == "NHD"
 
         # Process each layer's KV cache
         # NHD layout: [2, num_blocks, num_kv_heads, block_size, head_size]
@@ -2146,7 +2164,7 @@ class NixlConnectorWorker:
                     "in layer=%s (layout=%s, num_kv_heads=%d)",
                     block_id,
                     layer_name,
-                    self.host_buffer_kv_cache_layout,
+                    cache_layout,
                     num_kv_heads,
                 )
 
