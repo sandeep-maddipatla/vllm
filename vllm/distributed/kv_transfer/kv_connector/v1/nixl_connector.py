@@ -2086,6 +2086,9 @@ class NixlConnectorWorker:
             self.host_buffer_kv_cache_layout,
         )
 
+        # Start timing the transpose operation
+        start_time = time.perf_counter()
+
         # Determine layout for correct indexing
         is_nhd_layout = self.host_buffer_kv_cache_layout == "NHD"
 
@@ -2182,11 +2185,15 @@ class NixlConnectorWorker:
                     else:
                         k_cache[head_idx, block_id].copy_(k_head_transposed)
 
+        # Calculate elapsed time
+        elapsed_time_ms = (time.perf_counter() - start_time) * 1000
+
         logger.debug(
             "align_hetero_pd_cpuattn_kvcache_format: Completed K cache alignment for "
-            "%d blocks across %d layers",
+            "%d blocks across %d layers in %.2f ms",
             len(block_ids),
             len(kv_caches),
+            elapsed_time_ms,
         )
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
