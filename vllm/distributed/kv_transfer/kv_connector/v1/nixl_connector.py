@@ -21,6 +21,7 @@ import msgspec
 import numpy as np
 import torch
 import zmq
+import traceback
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -619,6 +620,7 @@ class NixlConnector(KVConnectorBase_V1):
         pass
 
     def wait_for_save(self):
+        traceback.print_stack()
         logger.debug('In wait_for_Save')
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
@@ -936,6 +938,7 @@ class NixlConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         from vllm.v1.request import RequestStatus
+        traceback.print_stack()
 
         params = request.kv_transfer_params
         logger.debug(
