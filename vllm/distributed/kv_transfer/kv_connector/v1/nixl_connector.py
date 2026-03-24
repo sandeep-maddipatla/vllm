@@ -619,6 +619,7 @@ class NixlConnector(KVConnectorBase_V1):
         pass
 
     def wait_for_save(self):
+        logger.debug('In wait_for_Save')
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
@@ -627,6 +628,7 @@ class NixlConnector(KVConnectorBase_V1):
             self.connector_worker.device_type == "cpu"
             and self.connector_worker.is_hetero_pd_cpuattn
         ):
+            logger.debug(f'{len(self._connector_metadata.reqs_to_save)=}')
             # For cases involving heterogeneous P/D with CPU attention: transpose K cache in device_kv_caches directly
             # CPU uses device_kv_caches as the NIXL transfer buffer. Pass that to the translator function
             for req_id, meta in self._connector_metadata.reqs_to_save.items():
@@ -1163,6 +1165,7 @@ class NixlConnectorWorker:
         self.is_hetero_pd_cpuattn = os.environ.get(
             "VLLM_HETERO_PD_CPU_ATTN", "0"
         ).lower() in ("1", "true")
+        logger.debug(f"{self.is_hetero_pd_cpuattn=}")
 
         # lazy initialized in register_kv_caches
         self.compat_hash: str | None = None

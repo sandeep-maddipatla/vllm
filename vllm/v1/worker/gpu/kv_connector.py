@@ -83,6 +83,7 @@ class ActiveKVConnector(KVConnector):
             return None
 
         output = KVConnectorOutput()
+        logger.info(f'in post_forward ... {wait_for_save=}')
         if wait_for_save:
             self.kv_connector.wait_for_save()
         output.finished_sending, output.finished_recving = (
@@ -98,6 +99,7 @@ class ActiveKVConnector(KVConnector):
         if self._disabled:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
+        logger.info(f'in no_forward')
         self.pre_forward(scheduler_output)
         kv_connector_output = self.post_forward(scheduler_output, wait_for_save=False)
         if kv_connector_output is None or kv_connector_output.is_empty():
