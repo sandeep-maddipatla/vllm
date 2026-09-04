@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner as GPUModelRunnerV2,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.mm_encoder_model_runner import MMEncoderModelRunner
 
 
 class XPUModelRunner(GPUModelRunner):
@@ -37,6 +38,34 @@ class XPUModelRunnerV2(GPUModelRunnerV2):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+
+class XPUMMEncoderModelRunner(MMEncoderModelRunner):
+    """An encoder-only model runner for XPU devices."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        with _torch_cuda_wrapper():
+            super().__init__(vllm_config, device)
+
+
+def get_xpu_model_runner_cls(
+    vllm_config: VllmConfig,
+) -> type[GPUModelRunner | GPUModelRunnerV2]:
+    """Pick the XPU model runner class for this config.
+
+    Mirrors the selection in `vllm.v1.worker.gpu_worker`: an encoder-only
+    instance builds the language model on the meta device, so the shared V2
+    runner cannot profile or run it.
+    """
+    if not vllm_config.use_v2_model_runner:
+        return XPUModelRunner
+    if vllm_config.is_mm_encoder_only:
+        return XPUMMEncoderModelRunner
+    return XPUModelRunnerV2
 
 
 @contextmanager
